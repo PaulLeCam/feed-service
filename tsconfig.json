@@ -1,0 +1,12 @@
+{
+  "compilerOptions": {
+    "allowSyntheticDefaultImports": true,
+    "declaration": true,
+    "esModuleInterop": true,
+    "lib": ["dom", "es2015"],
+    "moduleResolution": "node",
+    "strict": true,
+    "target": "esnext"
+  },
+  "exclude": ["node_modules", "lib"]
+}

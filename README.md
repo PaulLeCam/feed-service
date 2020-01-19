@@ -8,4 +8,5 @@ Authorization is handled by signing payloads when mutating the address space, so
 ## Running
 
 - Run `yarn` to install the dependencies
-- Run `yarn test` to start the server and make example client calls
+- Run `yarn run-docs` to start the server and make example client calls for doc-sync
+- Run `yarn run-feeds` to start the server and make example client calls for feeds

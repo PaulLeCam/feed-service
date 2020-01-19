@@ -1,13 +1,14 @@
 import { FeedParams } from '@erebos/bzz-feed'
 import { resJSON, resOrError } from '@erebos/bzz-node'
-import { Hex, hexInput } from '@erebos/hex'
+import { hexInput } from '@erebos/hex'
 import { pubKeyToAddress } from '@erebos/keccak256'
-import { KeyPair, createKeyPair, sign } from '@erebos/secp256k1'
+import { KeyPair, createKeyPair } from '@erebos/secp256k1'
 import fetch, { Response } from 'node-fetch'
 
-const URL = 'http://localhost:3000'
+import { signPayload } from './auth'
+import { SERVER_URL } from './constants'
 
-export default class ServiceClient {
+export default class Client {
   public address: string
   public keyPair: KeyPair
 
@@ -16,41 +17,48 @@ export default class ServiceClient {
     this.address = pubKeyToAddress(this.keyPair.getPublic('array'))
   }
 
-  protected encodeBody(data: hexInput): string {
-    const payload = Hex.from(data)
-    const signature = sign(payload.toBytesArray(), this.keyPair)
-    return JSON.stringify({
-      key: this.keyPair.getPublic('hex'),
-      payload: payload.value,
-      signature: Hex.from(signature).value,
-    })
+  protected getDocURL(label: string): string {
+    return `${SERVER_URL}/${this.address}/docs/${label}`
   }
 
   protected getFeedURL(label: string): string {
-    return `${URL}/${this.address}/feeds/${label}`
+    return `${SERVER_URL}/${this.address}/feeds/${label}`
   }
 
-  protected async fetchFeed(
+  protected async fetch(
     method: string,
-    label: string,
+    url: string,
     body: hexInput,
   ): Promise<Response> {
-    return await fetch(this.getFeedURL(label), {
+    return await fetch(url, {
       method,
-      body: this.encodeBody(body),
+      body: JSON.stringify(signPayload(this.keyPair, body)),
     })
+  }
+
+  public async setDoc(
+    label: string,
+    sources: Array<FeedParams>,
+  ): Promise<FeedParams> {
+    const res = await this.fetch('PUT', this.getDocURL(label), { sources })
+    return await resJSON<Response, FeedParams>(res)
+  }
+
+  public async deleteDoc(label: string): Promise<void> {
+    const res = await this.fetch('DELETE', this.getDocURL(label), label)
+    await resOrError<Response>(res)
   }
 
   public async setFeed(
     label: string,
     sources: Array<FeedParams>,
   ): Promise<FeedParams> {
-    const res = await this.fetchFeed('PUT', label, { sources })
+    const res = await this.fetch('PUT', this.getFeedURL(label), { sources })
     return await resJSON<Response, FeedParams>(res)
   }
 
   public async deleteFeed(label: string): Promise<void> {
-    const res = await this.fetchFeed('DELETE', label, label)
+    const res = await this.fetch('DELETE', this.getFeedURL(label), label)
     await resOrError<Response>(res)
   }
 }

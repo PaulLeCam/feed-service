@@ -1,31 +1,38 @@
 import { BzzFeed, FeedParams, PollFeedContentOptions } from '@erebos/bzz-feed'
 import { BzzNode } from '@erebos/bzz-node'
-import { Hex, hexInput } from '@erebos/hex'
+import { DocSynchronizer } from '@erebos/doc-sync'
 import { pubKeyToAddress } from '@erebos/keccak256'
-import {
-  KeyPair,
-  createKeyPair,
-  createPublic,
-  sign,
-  verify,
-} from '@erebos/secp256k1'
+import { createKeyPair, sign } from '@erebos/secp256k1'
+import Automerge from 'automerge'
 import { json, send } from 'micro'
 import { del, get, put, router } from 'microrouter'
 import { Subscription, merge } from 'rxjs'
 import { flatMap, throttleTime } from 'rxjs/operators'
 
+import {
+  AuthRequest,
+  checkAddress,
+  checkSignature,
+  checkPayload,
+  hashFeeds,
+} from './auth'
+import { BZZ_URL } from './constants'
+
+const PULL_INTERVAL = 10000
+
 const POLL_OPTIONS: PollFeedContentOptions = {
   changedOnly: true,
   immediate: true,
-  interval: 10000,
+  interval: PULL_INTERVAL,
   mode: 'raw',
   whenEmpty: 'ignore',
 }
 
 const PUSH_THROTTLE = 10000
 
+const bzz = new BzzNode({ url: BZZ_URL, timeout: 5000 })
 const bzzFeed = new BzzFeed({
-  bzz: new BzzNode({ url: 'http://localhost:8500', timeout: 5000 }),
+  bzz,
   signBytes: (bytes, key) => Promise.resolve(sign(bytes, key)),
 })
 
@@ -35,35 +42,58 @@ interface FeedState {
 }
 
 interface AddressState {
+  docs: Record<string, DocSynchronizer<any>>
   feeds: Record<string, FeedState>
 }
 
 const globalState: Record<string, AddressState> = {}
 
-function checkAddress(address: string, key: KeyPair): boolean {
-  return address === pubKeyToAddress(key.getPublic('array'))
+function getState(address: string): AddressState {
+  return globalState[address] ?? { docs: {}, feeds: {} }
 }
 
-function checkSignature(
-  payload: hexInput,
-  signature: hexInput,
-  pubKey: KeyPair,
-): boolean {
-  return verify(
-    Hex.from(payload).toBytesArray(),
-    Hex.from(signature).toBytesArray(),
-    pubKey,
-  )
+async function createDoc(
+  address: string,
+  label: string,
+  sources: Array<FeedParams>,
+): Promise<FeedParams> {
+  const state = getState(address)
+  const kp = createKeyPair()
+
+  const synchronizer = await DocSynchronizer.init({
+    bzz: new BzzFeed({
+      bzz,
+      signBytes: bytes => Promise.resolve(sign(bytes, kp)),
+    }),
+    doc: Automerge.init(),
+    feed: {
+      user: pubKeyToAddress(kp.getPublic('array')),
+      topic: hashFeeds(sources),
+    },
+    pullInterval: PULL_INTERVAL,
+    sources,
+  })
+
+  const existing = state.docs[label]
+  if (existing != null) {
+    existing.stop()
+  }
+
+  state.docs[label] = synchronizer
+  globalState[address] = state
+
+  return synchronizer.metaFeed
 }
 
-function parsePayload<T = any>(
-  payload: hexInput,
-  signature: hexInput,
-  pubKey: KeyPair,
-): T | null {
-  const data = Hex.from(payload)
-  const sig = Hex.from(signature).toBytesArray()
-  return verify(data.toBytesArray(), sig, pubKey) ? data.toObject<T>() : null
+function deleteDoc(address: string, label: string): boolean {
+  const state = getState(address)
+  const synchronizer = state.docs[label]
+  if (synchronizer == null) {
+    return false
+  }
+  synchronizer.stop()
+  delete state.docs[label]
+  return true
 }
 
 function createFeed(
@@ -71,11 +101,12 @@ function createFeed(
   label: string,
   sources: Array<FeedParams>,
 ): FeedParams {
-  const state = globalState[address] ?? { feeds: {} }
-
+  const state = getState(address)
   const kp = createKeyPair()
-  const user = pubKeyToAddress(kp.getPublic('array'))
-  const params = { user }
+  const feed = {
+    user: pubKeyToAddress(kp.getPublic('array')),
+    topic: hashFeeds(sources),
+  }
 
   const feeds = sources.map(source =>
     bzzFeed.pollContentHash(source, POLL_OPTIONS),
@@ -84,16 +115,16 @@ function createFeed(
     .pipe(
       throttleTime(PUSH_THROTTLE),
       flatMap(async hash => {
-        await bzzFeed.setContentHash(params, hash, undefined, kp)
+        await bzzFeed.setContentHash(feed, hash as string, undefined, kp)
         return hash
       }),
     )
     .subscribe({
       next: hash => {
-        console.log('Server pushed feed', params, hash)
+        console.log('Server pushed feed', feed, hash)
       },
       error: err => {
-        console.warn('Server feed subscription error', params, err)
+        console.warn('Server feed subscription error', feed, err)
       },
     })
 
@@ -102,24 +133,85 @@ function createFeed(
     existing.subscription.unsubscribe()
   }
 
-  state.feeds[label] = { params, subscription }
+  state.feeds[label] = { params: feed, subscription }
   globalState[address] = state
 
-  return params
+  return feed
 }
 
-function deleteFeed(address: string, label: string): void {
-  const state = globalState[address] ?? { feeds: {} }
+function deleteFeed(address: string, label: string): boolean {
+  const state = getState(address)
   const feed = state.feeds[label]
-  if (feed != null) {
-    feed.subscription.unsubscribe()
-    delete state.feeds[label]
+  if (feed == null) {
+    return false
   }
+  feed.subscription.unsubscribe()
+  delete state.feeds[label]
+  return true
 }
 
 export default router(
+  get('/:address/docs', (req, res) => {
+    const state = getState(req.params.address)
+    if (state == null) {
+      return send(res, 404)
+    }
+
+    const docs = Object.entries(state.docs).reduce(
+      (acc, [label, synchronizer]) => {
+        acc[label] = synchronizer.metaFeed
+        return acc
+      },
+      {} as Record<string, FeedParams>,
+    )
+    send(res, 200, docs)
+  }),
+
+  get('/:address/docs/:label', (req, res) => {
+    const { address, label } = req.params
+
+    const state = getState(address)
+    const synchronizer = state.docs[label]
+    if (synchronizer == null) {
+      return send(res, 404)
+    }
+
+    send(res, 200, synchronizer.metaFeed)
+  }),
+
+  put('/:address/docs/:label', async (req, res) => {
+    const { address, label } = req.params
+    const body = (await json(req)) as AuthRequest
+
+    if (!checkAddress(address, body.key)) {
+      return send(res, 401)
+    }
+
+    const data = checkPayload(body)
+    if (data === null) {
+      return send(res, 403)
+    }
+
+    const params = await createDoc(address, label, data.sources)
+    send(res, 200, params)
+  }),
+
+  del('/:address/docs/:label', async (req, res) => {
+    const { address, label } = req.params
+    const body = (await json(req)) as AuthRequest
+
+    if (!checkAddress(address, body.key)) {
+      return send(res, 401)
+    }
+    if (!checkSignature(body)) {
+      return send(res, 403)
+    }
+
+    send(res, deleteDoc(address, label) ? 204 : 404)
+  }),
+
   get('/:address/feeds', (req, res) => {
-    const state = globalState[req.params.address]
+    const state = getState(req.params.address)
     if (state == null) {
       return send(res, 404)
     }
@@ -127,18 +219,14 @@ export default router(
     const feeds = Object.entries(state.feeds).reduce((acc, [label, feed]) => {
       acc[label] = feed.params
       return acc
-    }, {})
+    }, {} as Record<string, FeedParams>)
     send(res, 200, feeds)
   }),
 
   get('/:address/feeds/:label', (req, res) => {
     const { address, label } = req.params
 
-    const state = globalState[address]
-    if (state == null) {
-      return send(res, 404)
-    }
-
+    const state = getState(address)
     const feed = state.feeds[label]
     if (feed == null) {
       return send(res, 404)
@@ -149,14 +237,13 @@ export default router(
 
   put('/:address/feeds/:label', async (req, res) => {
     const { address, label } = req.params
-    const body = await json(req)
-    const pubKey = createPublic(body.key)
+    const body = (await json(req)) as AuthRequest
 
-    if (!checkAddress(address, pubKey)) {
+    if (!checkAddress(address, body.key)) {
       return send(res, 401)
     }
 
-    const data = parsePayload(body.payload, body.signature, pubKey)
+    const data = checkPayload(body)
     if (data === null) {
       return send(res, 403)
     }
@@ -166,22 +253,15 @@ export default router(
 
   del('/:address/feeds/:label', async (req, res) => {
     const { address, label } = req.params
-    const body = await json(req)
-    const pubKey = createPublic(body.key)
+    const body = (await json(req)) as AuthRequest
 
-    if (!checkAddress(address, pubKey)) {
+    if (!checkAddress(address, body.key)) {
       return send(res, 401)
     }
-    if (!checkSignature(label, body.signature, pubKey)) {
+    if (!checkSignature(body)) {
       return send(res, 403)
     }
 
-    const state = globalState[address]
-    if (state == null) {
-      return send(res, 404)
-    }
-
-    deleteFeed(address, label)
-    send(res, 204)
+    send(res, deleteFeed(address, label) ? 204 : 404)
   }),
 )

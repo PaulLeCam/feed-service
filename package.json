@@ -9,14 +9,17 @@
     "build": "babel src --out-dir lib --extensions \".ts\"",
     "dev": "micro-dev",
     "start": "micro",
-    "test": "node lib/run.js"
+    "run-docs": "node lib/run-docs.js",
+    "run-feeds": "node lib/run-feeds.js"
   },
   "dependencies": {
     "@erebos/bzz-feed": "^0.13.1",
     "@erebos/bzz-node": "^0.13.0",
+    "@erebos/doc-sync": "^0.13.1",
     "@erebos/hex": "^0.13.0",
     "@erebos/keccak256": "^0.13.1",
     "@erebos/secp256k1": "^0.10.0",
+    "automerge": "^0.12.1",
     "micro": "^9.3.4",
     "microrouter": "^3.1.3",
     "node-fetch": "^2.6.0",
